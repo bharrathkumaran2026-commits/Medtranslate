@@ -150,6 +150,109 @@ def _normalize_response_contract(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _enrich_prescription_medicines(
+    medicines: list[dict[str, Any]],
+    language: str,
+) -> list[dict[str, Any]]:
+    """Enrich extracted prescription medicines with DailyMed retrieval and explanations."""
+    try:
+        from backend.explanation_generator import generate_medicine_explanation
+        from backend.medical_retriever import retrieve_medicine_info
+    except ImportError:
+        logger.info("Retrieval/explanation modules unavailable; keeping Stage 1 medicines.")
+        return medicines
+
+    enriched: list[dict[str, Any]] = []
+    for med in medicines:
+        if not isinstance(med, dict):
+            continue
+
+        # Authoritative prescription facts from Stage 1 (never overwritten by Stage 2)
+        authoritative_med: dict[str, Any] = {
+            "name": med.get("name"),
+            "strength": med.get("strength"),
+            "dosage": med.get("dosage"),
+            "frequency": med.get("frequency"),
+            "timing": med.get("timing"),
+            "duration": med.get("duration"),
+        }
+
+        med_name = (authoritative_med.get("name") or "").strip() if isinstance(authoritative_med.get("name"), str) else ""
+        if not med_name:
+            enriched.append(
+                {
+                    **authoritative_med,
+                    "purpose": None,
+                    "important_information": [],
+                    "common_information": [],
+                    "source": {"name": "DailyMed", "url": None},
+                }
+            )
+            continue
+
+        try:
+            medical_info = retrieve_medicine_info(med_name)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("DailyMed retrieval failed for '%s': %s", med_name, exc)
+            medical_info = {
+                "medicine": med_name,
+                "source": "DailyMed",
+                "source_url": None,
+                "retrieval_status": "error",
+                "purpose_information": None,
+                "important_information": [],
+            }
+
+        try:
+            explanation = generate_medicine_explanation(
+                authoritative_med,
+                medical_info,
+                language=language,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Explanation generation failed for '%s': %s", med_name, exc)
+            explanation = {"error": "Explanation generation failed."}
+
+        source = explanation.get("source")
+        if not isinstance(source, dict):
+            source = {
+                "name": medical_info.get("source") or "DailyMed",
+                "url": medical_info.get("source_url"),
+            }
+
+        if explanation.get("error"):
+            enriched.append(
+                {
+                    **authoritative_med,
+                    "purpose": None,
+                    "important_information": [],
+                    "common_information": [],
+                    "source": source,
+                    "error": "Patient-friendly explanation temporarily unavailable.",
+                }
+            )
+        else:
+            enriched.append(
+                {
+                    **authoritative_med,
+                    "purpose": explanation.get("purpose"),
+                    "important_information": (
+                        explanation.get("important_information")
+                        if isinstance(explanation.get("important_information"), list)
+                        else []
+                    ),
+                    "common_information": (
+                        explanation.get("common_information")
+                        if isinstance(explanation.get("common_information"), list)
+                        else []
+                    ),
+                    "source": source,
+                }
+            )
+
+    return enriched
+
+
 def _invoke_ai_pipeline(processed_doc: dict[str, Any], language: str) -> dict[str, Any]:
     """Call Member 3's AI pipeline, falling back to mock JSON if unavailable."""
     try:
@@ -160,7 +263,13 @@ def _invoke_ai_pipeline(processed_doc: dict[str, Any], language: str) -> dict[st
 
     try:
         result = run_medtranslate_pipeline(processed_doc, language)
-        return _normalize_response_contract(result)
+        normalized = _normalize_response_contract(result)
+        if normalized["document_type"] == "prescription" and normalized["medicines"]:
+            normalized["medicines"] = _enrich_prescription_medicines(
+                normalized["medicines"],
+                language=language,
+            )
+        return normalized
     except NotImplementedError:
         logger.info("run_medtranslate_pipeline raised NotImplementedError; returning mock JSON.")
         return _build_mock_response(processed_doc, language)

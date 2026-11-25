@@ -20,3 +20,11 @@ env/
 .idea/
 .DS_Store
 Thumbs.db
+
+#test_data
+test_data/
+
+#testpy
+test_explanation.py
+test_models.py
+integration_test.py
